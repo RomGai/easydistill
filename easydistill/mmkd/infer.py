@@ -164,19 +164,8 @@ def generate_teacher_logits_batch(processor, llm, data_list, config, batch_size=
     if configured_topk is None or configured_topk <= 0:
         # top_logits_num 未显式设置时，请求整张词表，确保目标 token 的真实概率可用
         logprobs_num = vocab_size
-        logging.info(
-            "top_logits_num is unset/<=0; requesting full-vocab logprobs (%d tokens)",
-            logprobs_num,
-        )
     else:
         logprobs_num = min(vocab_size, max(configured_topk, len(target_token_ids)))
-        if logprobs_num < vocab_size:
-            logging.info(
-                "Requesting top-%d logprobs; ensure the configured value is large enough "
-                "to cover tokens %s",
-                logprobs_num,
-                target_token_ids,
-            )
 
     sampling_params = SamplingParams(
         n = 1,
