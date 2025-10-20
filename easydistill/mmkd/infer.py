@@ -150,6 +150,34 @@ def generate_teacher_response_batch(processor, llm, data_list, config, batch_siz
 def generate_teacher_logits_batch(processor, llm, data_list, config, batch_size=32):
 
     outcomes = []
+
+    # 默认按照用户指定的 token （"1"~"5"）收集概率；也支持通过配置覆盖
+    target_tokens = config["inference"].get(
+        "target_logprob_tokens", ["1", "2", "3", "4", "5"]
+    )
+    tokenizer = processor.tokenizer
+    target_token_ids = [tokenizer.convert_tokens_to_ids(tok) for tok in target_tokens]
+    target_token_keys = [str(token_id) for token_id in target_token_ids]
+
+    vocab_size = getattr(tokenizer, "vocab_size", None) or len(tokenizer)
+    configured_topk = config["inference"].get("top_logits_num")
+    if configured_topk is None or configured_topk <= 0:
+        # top_logits_num 未显式设置时，请求整张词表，确保目标 token 的真实概率可用
+        logprobs_num = vocab_size
+        logging.info(
+            "top_logits_num is unset/<=0; requesting full-vocab logprobs (%d tokens)",
+            logprobs_num,
+        )
+    else:
+        logprobs_num = min(vocab_size, max(configured_topk, len(target_token_ids)))
+        if logprobs_num < vocab_size:
+            logging.info(
+                "Requesting top-%d logprobs; ensure the configured value is large enough "
+                "to cover tokens %s",
+                logprobs_num,
+                target_token_ids,
+            )
+
     sampling_params = SamplingParams(
         n = 1,
         top_k = 1,
@@ -157,7 +185,7 @@ def generate_teacher_logits_batch(processor, llm, data_list, config, batch_size=
         seed = config["inference"]["seed"],
         skip_special_tokens=False,
         max_tokens = config["inference"]["max_new_tokens"],
-        logprobs=config["inference"]["top_logits_num"],
+        logprobs=logprobs_num,
     )
     batches = [data_list[i:i + batch_size] for i in range(0, len(data_list), batch_size)]
     logits=[]
@@ -186,7 +214,7 @@ def generate_teacher_logits_batch(processor, llm, data_list, config, batch_size=
         logits+=[output.outputs[0].logprobs for output in outputs]
 
         for b in range(len(batch_outcomes)):
-       
+
             generated_text = outputs[b].outputs[0].text
             out={
                 "role": "assistant",
@@ -200,14 +228,31 @@ def generate_teacher_logits_batch(processor, llm, data_list, config, batch_size=
             batch_outcomes[b].append(out)
         outcomes.extend(batch_outcomes)
 
+    filtered_logits = []
+    missing_token_ids = set()
     for logit in logits:
+        filtered_steps = []
         for pos in logit:
-            for k,v in pos.items():
-                pos[k]=math.exp(v.logprob)
-    
+            filtered_pos = {}
+            for key, token_id in zip(target_token_keys, target_token_ids):
+                candidate = pos.get(key)
+                if candidate is None:
+                    missing_token_ids.add(token_id)
+                    continue
+                filtered_pos[key] = math.exp(candidate.logprob)
+            filtered_steps.append(filtered_pos)
+        filtered_logits.append(filtered_steps)
+
+    if missing_token_ids:
+        raise RuntimeError(
+            "Teacher logprobs did not contain the requested token ids %s. "
+            "Increase inference.top_logits_num (or set it <= 0 to request the full vocab) "
+            "and retry."
+            % sorted(missing_token_ids)
+        )
+
     with jsonlines.open(config["dataset"]["logits_path"], mode='w') as writer:
-        for row in logits:
-            #for item in row:
+        for row in filtered_logits:
             writer.write(row)
     
     write_data_to_json_file(outcomes, config["dataset"]["labeled_path"])
